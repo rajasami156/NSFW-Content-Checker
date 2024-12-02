@@ -8,127 +8,134 @@ from PIL import Image
 from transformers import AutoModelForImageClassification, ViTImageProcessor
 from io import BytesIO
 
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("NSFW-Detector")
+
+# GPU and Resource Logging
+logger.info("Checking system resources...")
+gpu_available = torch.cuda.is_available()
+logger.info(f"PyTorch CUDA Available: {gpu_available}")
+if gpu_available:
+    logger.info(f"Using CUDA Device: {torch.cuda.get_device_name(0)}")
+else:
+    logger.info("CUDA not available. Using CPU.")
+
 # Initialize FastAPI app
 app = FastAPI()
 
-# Configure logging for production
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger("uvicorn")
-
-# CORS configuration (allowing requests from any origin in this example)
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins, adjust as per your use case
+    allow_origins=["*"],  # Adjust for production as needed
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Path to model directory
-model_directory = './nsfw_image_detection'
+# Paths
+MODEL_DIR = "./nsfw_image_detection"
 
-# Check if GPU is available
-device = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info(f"Using device: {device}")
+# Device setup
+device = "cuda" if gpu_available else "cpu"
 
-# Load the model and processor once, to optimize performance
-model = AutoModelForImageClassification.from_pretrained(model_directory).to(device)
-processor = ViTImageProcessor.from_pretrained(model_directory)
+# Load model and processor
+logger.info("Loading model and processor...")
+try:
+    model = AutoModelForImageClassification.from_pretrained(MODEL_DIR).to(device)
+    processor = ViTImageProcessor.from_pretrained(MODEL_DIR)
+    logger.info("Model and processor loaded successfully.")
+except Exception as e:
+    logger.critical(f"Failed to load model or processor: {e}", exc_info=True)
+    raise RuntimeError("Model or processor loading failed.")
 
-# Log the model device configuration
-logger.info(f"Model is on device: {model.device}")
-
-# Helper function to predict NSFW content
-def predict_nsfw(image: Image.Image):
+# Helper function: Image classification
+def classify_image(image: Image.Image):
+    """Classify the image as NSFW or Safe."""
     try:
-        # Preprocess the image
+        logger.info("Preparing image for inference...")
         inputs = processor(images=image, return_tensors="pt").to(device)
 
-        # Perform the classification
-        logger.info(f"Running inference on device: {device}")
+        logger.info("Performing inference...")
         with torch.no_grad():
             outputs = model(**inputs)
             logits = outputs.logits
 
-        # Get the predicted label
+        # Get predictions
         predicted_label = logits.argmax(-1).item()
         label = model.config.id2label[predicted_label]
-
-        # Confidence score (optional)
         confidence = torch.nn.functional.softmax(logits, dim=-1).max().item()
-
+        logger.info(f"Inference complete: Label={label}, Confidence={confidence:.2f}")
         return label, confidence
     except Exception as e:
-        logger.error(f"Error in NSFW prediction: {e}")
-        raise HTTPException(status_code=500, detail="Error in NSFW prediction")
+        logger.error(f"Error during classification: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error during classification.")
 
-# Helper function to validate the file (no size validation here as it's handled by Nginx)
+# Helper function: Validate image file
 def validate_image(file: UploadFile):
-    # Check file type (only accept JPEG/PNG)
-    if file.content_type not in ['image/jpeg', 'image/png']:
-        logger.warning(f"Invalid file type received: {file.content_type}")
-        raise HTTPException(status_code=400, detail="Invalid file type. Only JPEG and PNG are allowed.")
-    
-    logger.info(f"Received file: {file.filename} of type {file.content_type}")
+    """Validate uploaded image file type."""
+    logger.info(f"Validating file: {file.filename}...")
+    if file.content_type not in ["image/jpeg", "image/png"]:
+        logger.warning(f"Unsupported file format: {file.content_type}")
+        raise HTTPException(status_code=400, detail="Invalid file format. Only JPEG and PNG are supported.")
+    logger.info(f"File {file.filename} validated successfully.")
 
-# POST endpoint to classify the image
+# Root endpoint
+@app.get("/")
+async def root():
+    logger.info("Root endpoint accessed.")
+    return {"message": "NSFW Detection API is running."}
+
+# Image classification endpoint
 @app.post("/classify_image/")
-async def classify_image(file: UploadFile = File(...)):
+async def classify_image_endpoint(file: UploadFile = File(...)):
+    """Endpoint to classify NSFW content."""
     try:
-        # Validate the uploaded image file
+        # Validate image
         validate_image(file)
 
-        # Read the image data and process it
+        # Read and process image
+        logger.info("Reading uploaded file...")
         image_data = await file.read()
-        image = Image.open(BytesIO(image_data))
+        image = Image.open(BytesIO(image_data)).convert("RGB")
+        logger.info(f"Image {file.filename} loaded successfully.")
 
-        # Log the processing start
-        logger.info(f"Processing image: {file.filename}")
+        # Perform classification
+        label, confidence = classify_image(image)
 
-        # Predict NSFW content
-        label, confidence = predict_nsfw(image)
-
-        # Log the result
-        logger.info(f"Prediction for image {file.filename}: {label}, Confidence: {confidence * 100:.2f}%")
-
-        # Return the response based on classification
-        if label == 'nsfw':
-            return JSONResponse(content={
-                "NSFW Content": True,
-                "NSFW Content Percentage": round(confidence * 100, 2)
-            })
-        else:
-            return JSONResponse(content={
-                "NSFW Content": False,
-                "NSFW Content Percentage": 0
-            })
+        # Construct response
+        logger.info("Constructing response...")
+        response = {
+            "NSFW Content": label == "nsfw",
+            "Confidence Percentage": round(confidence * 100, 2)
+        }
+        logger.info("Response constructed successfully.")
+        return JSONResponse(content=response, status_code=200)
 
     except HTTPException as e:
-        # Log known exceptions (like file validation errors)
         logger.warning(f"HTTPException: {e.detail}")
         return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
     except Exception as e:
-        # Log unexpected errors
-        logger.error(f"Unexpected error: {str(e)}")
-        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"detail": "Internal server error."})
 
-# Error handler for 404 (Resource not found)
+# 404 error handler
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):
-    logger.warning(f"HTTPException occurred: {exc.detail} at {request.url.path}")
+    logger.warning(f"HTTPException at {request.url.path}: {exc.detail}")
     return JSONResponse(
         status_code=exc.status_code,
-        content={"message": exc.detail},
+        content={"message": exc.detail}
     )
 
-# Catch-all error handler for unexpected errors
+# Catch-all error handler
 @app.exception_handler(Exception)
 async def exception_handler(request, exc: Exception):
-    logger.error(f"Unhandled exception occurred: {str(exc)} at {request.url.path}")
+    logger.error(f"Unhandled exception at {request.url.path}: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"message": "An unexpected error occurred. Please try again later."},
+        content={"message": "An unexpected error occurred. Please try again later."}
     )
